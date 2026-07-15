@@ -16,7 +16,10 @@ const MessagingProductWhatsApp = MessagingProduct("whatsapp")
 type RecipientType string
 
 // RecipientTypeIndividual addresses a single WhatsApp user.
-// Group messaging is not supported by the Cloud API.
+//
+// It is the only value appearing in Meta's documented examples. The parameter
+// reference does not enumerate the allowed values, so whether any other
+// recipient type (a group, say) exists is unverified rather than ruled out.
 const RecipientTypeIndividual = RecipientType("individual")
 
 // MessageType is the outbound message type discriminator.
