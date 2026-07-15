@@ -15,12 +15,13 @@ const (
 	DefaultBaseURL = "https://graph.facebook.com"
 
 	// DefaultGraphVersion is the Graph API version this client targets.
+	// v25.0 was released 2026-02-18 and is the latest as of 2026-07-15.
 	//
 	// Meta deprecates Graph API versions on a rolling ~2 year schedule, so this
-	// is a deliberate, visible constant rather than an inline literal. Verify it
-	// against https://developers.facebook.com/docs/graph-api/changelog before
-	// relying on it, and override via Client.GraphVersion to pin a different one.
-	DefaultGraphVersion = "v21.0"
+	// is a deliberate, visible constant rather than an inline literal. Check
+	// https://developers.facebook.com/docs/graph-api/changelog when bumping, and
+	// override via Client.GraphVersion to pin a different one.
+	DefaultGraphVersion = "v25.0"
 
 	// DefaultTimeout bounds every request. The Graph API has no server-side cap
 	// that protects a client without one.

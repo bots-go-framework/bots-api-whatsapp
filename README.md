@@ -5,7 +5,7 @@
 [![GoDoc](https://pkg.go.dev/badge/github.com/bots-go-framework/bots-api-whatsapp)](https://pkg.go.dev/github.com/bots-go-framework/bots-api-whatsapp)
 
 Go bindings for the [WhatsApp Cloud API](https://developers.facebook.com/docs/whatsapp/cloud-api),
-targeting **Graph API v21.0**.
+targeting **Graph API v25.0**.
 
 > **Status: early.** The client core (transport, retry, error model) is in place
 > and tested. The message-type surface is currently text-only — see
