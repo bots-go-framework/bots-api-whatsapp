@@ -170,16 +170,61 @@ func TestSendText_errorDoesNotLeakRecipientOrBody(t *testing.T) {
 	assert.True(t, AsAPIError(err).IsAuthError())
 }
 
-// TestMakeRequest_retriesOnRateLimitHonoringRetryAfter pins that a 429 is retried
-// and that Retry-After is honored rather than ignored.
-func TestMakeRequest_retriesOnRateLimitHonoringRetryAfter(t *testing.T) {
+// TestMakeRequest_retriesOnRateLimit pins throttling as the Cloud API actually
+// reports it: HTTP 400 carrying code 130429 — NOT HTTP 429, and with no
+// Retry-After header. Meta's error reference documents neither.
+//
+// This is the shape to trust. Several third-party clients (including at least one
+// Go library) model the throttling codes as 429; they are wrong, and a test that
+// asserted 429 here would pin behavior that never occurs.
+func TestMakeRequest_retriesOnRateLimit(t *testing.T) {
+	var attempts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"(#130429) Rate limit hit","code":130429,"error_data":{"messaging_product":"whatsapp","details":"Cloud API message throughput has been reached."}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[{"id":"wamid.OK"}]}`))
+	}))
+	defer ts.Close()
+
+	c := newTestClient(ts)
+	resp, err := c.SendText(context.Background(), "16505551234", "hi")
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, attempts, "code 130429 on an HTTP 400 must still be retried")
+	assert.Equal(t, "wamid.OK", resp.MessageID())
+}
+
+// TestAPIError_rateLimitClassifiedOnCodeNotStatus pins that throttling is
+// recognised from the code alone, since the accompanying status is 400.
+func TestAPIError_rateLimitClassifiedOnCodeNotStatus(t *testing.T) {
+	for _, code := range []int{
+		ErrCodeAPITooManyCalls,
+		ErrCodeRateLimitIssues,
+		ErrCodeRateLimitHit,
+		ErrCodeSpamRateLimitHit,
+		ErrCodeTemplateCategorizationLimit,
+	} {
+		e := &APIError{Code: code, HTTPStatusCode: http.StatusBadRequest}
+		assert.Truef(t, e.IsRateLimited(), "code %d on HTTP 400 must classify as rate limited", code)
+		assert.Truef(t, e.IsTransient(), "code %d must be retryable", code)
+	}
+}
+
+// TestMakeRequest_honorsRetryAfterIfPresent pins the defensive path: Meta is not
+// expected to send Retry-After, but an edge or proxy might, and it should be
+// respected rather than ignored if it appears.
+func TestMakeRequest_honorsRetryAfterIfPresent(t *testing.T) {
 	var attempts int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
 		if attempts == 1 {
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"message":"rate limit","code":130429}}`))
+			_, _ = w.Write([]byte(`{"error":{"message":"throttled by edge","code":130429}}`))
 			return
 		}
 		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[{"id":"wamid.OK"}]}`))
@@ -188,13 +233,29 @@ func TestMakeRequest_retriesOnRateLimitHonoringRetryAfter(t *testing.T) {
 
 	c := newTestClient(ts)
 	start := time.Now()
-	resp, err := c.SendText(context.Background(), "16505551234", "hi")
+	_, err := c.SendText(context.Background(), "16505551234", "hi")
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, attempts, "a 429 must be retried")
-	assert.Equal(t, "wamid.OK", resp.MessageID())
-	assert.GreaterOrEqual(t, elapsed, time.Second, "Retry-After: 1 must actually be waited out")
+	assert.Equal(t, 2, attempts)
+	assert.GreaterOrEqual(t, elapsed, time.Second, "a present Retry-After must be waited out")
+}
+
+// TestAPIError_templateSyncingNotRetriedInProcess pins that a syncing template is
+// not retried here: it can take 10 minutes to clear, which no retry budget covers.
+func TestAPIError_templateSyncingNotRetriedInProcess(t *testing.T) {
+	e := &APIError{Code: ErrCodeTemplateSyncing, HTTPStatusCode: http.StatusBadRequest}
+	assert.True(t, e.IsTemplateError())
+	assert.False(t, e.IsTransient(), "10-minute sync must not burn the in-process retry budget")
+}
+
+// TestAPIError_notDeliveredIsNotFastRetried pins the conservative reading of
+// Meta's self-contradictory 131049 guidance ("wait 24 hours" / "doing so will
+// only result in another error"). Both readings agree a fast retry is wrong.
+func TestAPIError_notDeliveredIsNotFastRetried(t *testing.T) {
+	e := &APIError{Code: ErrCodeNotDelivered, HTTPStatusCode: http.StatusBadRequest}
+	assert.True(t, e.IsUnreachable())
+	assert.False(t, e.IsTransient())
 }
 
 // TestMakeRequest_doesNotRetryPermanentErrors pins that a non-transient error

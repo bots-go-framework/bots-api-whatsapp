@@ -133,26 +133,72 @@ older clients rather than a considered convention:
 | `ctx` is the first parameter of every API call and reaches `http.NewRequestWithContext` | Telegram's client holds a context for logging only and never propagates it |
 | Default `http.Client.Timeout` | The older clients use a bare `&http.Client{}` with no timeout |
 | JSON request bodies | `url.Values` encoding is a Telegram Bot API accommodation; the Cloud API takes JSON |
-| Retry honors `Retry-After` on 429/5xx | Telegram's client string-matches a GAE error and has no rate-limit handling |
+| Retry classifies on `error.code`, with exponential backoff | Telegram's client string-matches a GAE error and has no rate-limit handling. See the note below on why *not* 429/`Retry-After`. |
 | Access token is unexported | An exported, serializable token field is a leak vector |
 | Errors never echo request URL or body | The older client formats request params into a 401 error, and those reach logs |
+
+### Why not `429` / `Retry-After`
+
+The Cloud API does **not** signal throttling with HTTP 429, and does **not** send
+a `Retry-After` header. Meta's error reference mentions neither: rate limits
+arrive as **HTTP 400** carrying an error code (`4`, `80007`, `130429`, `131048`,
+`131064`).
+
+This matters because several third-party clients — including at least one Go
+library — annotate those codes as 429. Building on that assumption yields retry
+logic that never fires.
+
+So this client classifies on `error.code` and ignores HTTP status for that
+decision. `Retry-After` is still honored *if present*, defensively, in case an
+edge or proxy throttles ahead of Meta — but nothing depends on it appearing.
+
+For the same reason, never string-match error text: Meta's documented wording for
+`131047` and the wording that actually arrives on the wire differ, and Meta says
+code titles "will eventually be deprecated". Branch on the integer.
 
 ## Roadmap
 
 Implemented:
 
-- Client core: bearer auth, JSON transport, retry with `Retry-After`, typed errors
+- Client core: bearer auth, JSON transport, retry with backoff, typed errors
 - `text` messages
+- `template` messages — named and positional body parameters
 
 Not yet implemented:
 
+- Template `header` and `button` components, and the `currency` / `date_time` /
+  media parameter types. Deliberately omitted: Meta's current docs do not spell
+  out their nested shapes, and guessing at a wire format is worse than not
+  shipping it.
 - Media: `image`, `audio`, `document`, `sticker`, `video` (upload → media ID → send by ID)
-- `template` messages — **required** for sending outside the 24-hour window
 - `interactive` messages (buttons, lists)
 - `location`, `contacts`, `reaction`
 - Inbound webhook payload types, `X-Hub-Signature-256` verification, and the
   `hub.challenge` verification handshake
 - Message status callbacks (sent / delivered / read / failed)
+
+## Sending a template
+
+```go
+// No placeholders.
+resp, err := client.SendTemplate(ctx, to, "hello_world", "en_US")
+
+// Positional placeholders: {{1}}, {{2}} ...
+resp, err := client.SendTemplate(ctx, to, "order_confirmation", "en_US",
+	"Jessica", "SKBUP2-4CPIG9")
+
+// Named placeholders: {{first_name}} ...
+cfg := wabotapi.NewSendTemplate(to, "order_confirmation", "en_US").
+	WithNamedBodyParams(
+		wabotapi.NamedParam{Name: "first_name", Value: "Jessica"},
+		wabotapi.NamedParam{Name: "order_number", Value: "SKBUP2-4CPIG9"},
+	)
+resp, err := client.SendMessage(ctx, cfg)
+```
+
+A template declares its parameter format at creation time and defaults to
+positional. A component may not mix the two formats; this client rejects that
+locally rather than spending a round trip to earn a `132018` validation error.
 
 ## Related
 
