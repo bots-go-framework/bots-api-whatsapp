@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -260,21 +261,23 @@ func TestMakeRequest_unreachableHost(t *testing.T) {
 
 // TestMakeRequest_nonJSONErrorBody covers a non-2xx whose body is not a Cloud API
 // error envelope — e.g. an HTML page from a proxy.
+//
+// A 502 is transient, so this retries through the full backoff. The bubble makes
+// that free: the test is about the error SHAPE, not the waiting.
 func TestMakeRequest_nonJSONErrorBody(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadGateway)
-		_, _ = w.Write([]byte(`<html>502 Bad Gateway</html>`))
-	}))
-	defer ts.Close()
+	synctest.Test(t, func(t *testing.T) {
+		tr := &scriptedTransport{responses: []scriptedResponse{
+			{status: http.StatusBadGateway, body: `<html>502 Bad Gateway</html>`},
+		}}
+		_, err := scriptedClient(tr).SendText(context.Background(), "16505551234", "hi")
+		require.Error(t, err)
 
-	_, err := newTestClient(ts).SendText(context.Background(), "16505551234", "hi")
-	require.Error(t, err)
-
-	apiErr := AsAPIError(err)
-	require.NotNil(t, apiErr, "a non-envelope failure must still surface as *APIError")
-	assert.Equal(t, http.StatusBadGateway, apiErr.HTTPStatusCode)
-	// The body may be anything; it must not be echoed.
-	assert.NotContains(t, err.Error(), "<html>")
+		apiErr := AsAPIError(err)
+		require.NotNil(t, apiErr, "a non-envelope failure must still surface as *APIError")
+		assert.Equal(t, http.StatusBadGateway, apiErr.HTTPStatusCode)
+		// The body may be anything; it must not be echoed.
+		assert.NotContains(t, err.Error(), "<html>")
+	})
 }
 
 // TestMakeRequest_marshalFailure covers the request-encoding branch.
@@ -286,24 +289,6 @@ func TestMakeRequest_marshalFailure(t *testing.T) {
 	_, err := newTestClient(ts).MakeRequest(context.Background(), http.MethodPost, "x/messages", make(chan int))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "marshal")
-}
-
-// TestMakeRequest_givesUpAfterMaxAttempts pins the retry budget.
-func TestMakeRequest_givesUpAfterMaxAttempts(t *testing.T) {
-	var attempts int
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"message":"unknown","code":131000}}`))
-	}))
-	defer ts.Close()
-
-	c := newTestClient(ts)
-	// Retry-After 0 keeps the exponential backoff short enough for a test.
-	_, err := c.SendText(context.Background(), "16505551234", "hi")
-	require.Error(t, err)
-	assert.Equal(t, maxAttempts, attempts)
-	assert.Contains(t, err.Error(), "giving up")
 }
 
 // TestMakeRequest_getWithNoBody covers the nil-payload path.

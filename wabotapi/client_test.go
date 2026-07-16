@@ -5,7 +5,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -170,32 +172,70 @@ func TestSendText_errorDoesNotLeakRecipientOrBody(t *testing.T) {
 	assert.True(t, AsAPIError(err).IsAuthError())
 }
 
+// scriptedResponse is one canned HTTP reply.
+type scriptedResponse struct {
+	status int
+	body   string
+	header http.Header
+}
+
+// scriptedTransport replays canned responses WITHOUT touching the network.
+//
+// This exists so the retry tests can run inside a testing/synctest bubble, where the
+// clock is fake and a 4-second backoff completes in zero real time. synctest only
+// advances time when every goroutine is durably blocked, and a goroutine waiting on
+// a socket is not — so httptest and synctest deadlock. Meta's own docs say it:
+// "Avoid using the network. Use a fake network implementation as needed."
+//
+// The wire-contract tests keep using httptest, where a real round trip IS the point.
+// This fake is only for tests about timing.
+type scriptedTransport struct {
+	responses []scriptedResponse
+	attempts  int
+}
+
+func (t *scriptedTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	i := t.attempts
+	t.attempts++
+	if i >= len(t.responses) {
+		i = len(t.responses) - 1 // repeat the last response forever
+	}
+	r := t.responses[i]
+	h := r.header
+	if h == nil {
+		h = http.Header{}
+	}
+	return &http.Response{
+		StatusCode: r.status,
+		Body:       io.NopCloser(strings.NewReader(r.body)),
+		Header:     h,
+	}, nil
+}
+
+// scriptedClient returns a Client whose transport replays responses.
+func scriptedClient(tr *scriptedTransport) *Client {
+	return NewClientWithHTTPClient("test-token", "1234567890", &http.Client{Transport: tr})
+}
+
 // TestMakeRequest_retriesOnRateLimit pins throttling as the Cloud API actually
 // reports it: HTTP 400 carrying code 130429 — NOT HTTP 429, and with no
 // Retry-After header. Meta's error reference documents neither.
 //
-// This is the shape to trust. Several third-party clients (including at least one
-// Go library) model the throttling codes as 429; they are wrong, and a test that
+// This is the shape to trust. Several third-party clients (including at least one Go
+// library) model the throttling codes as 429; they are wrong, and a test that
 // asserted 429 here would pin behavior that never occurs.
 func TestMakeRequest_retriesOnRateLimit(t *testing.T) {
-	var attempts int
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		if attempts == 1 {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":{"message":"(#130429) Rate limit hit","code":130429,"error_data":{"messaging_product":"whatsapp","details":"Cloud API message throughput has been reached."}}}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[{"id":"wamid.OK"}]}`))
-	}))
-	defer ts.Close()
+	synctest.Test(t, func(t *testing.T) {
+		tr := &scriptedTransport{responses: []scriptedResponse{
+			{status: http.StatusBadRequest, body: `{"error":{"message":"(#130429) Rate limit hit","code":130429,"error_data":{"messaging_product":"whatsapp","details":"Cloud API message throughput has been reached."}}}`},
+			{status: http.StatusOK, body: `{"messaging_product":"whatsapp","messages":[{"id":"wamid.OK"}]}`},
+		}}
+		resp, err := scriptedClient(tr).SendText(context.Background(), "16505551234", "hi")
 
-	c := newTestClient(ts)
-	resp, err := c.SendText(context.Background(), "16505551234", "hi")
-
-	require.NoError(t, err)
-	assert.Equal(t, 2, attempts, "code 130429 on an HTTP 400 must still be retried")
-	assert.Equal(t, "wamid.OK", resp.MessageID())
+		require.NoError(t, err)
+		assert.Equal(t, 2, tr.attempts, "code 130429 on an HTTP 400 must still be retried")
+		assert.Equal(t, "wamid.OK", resp.MessageID())
+	})
 }
 
 // TestAPIError_rateLimitClassifiedOnCodeNotStatus pins that throttling is
@@ -217,28 +257,51 @@ func TestAPIError_rateLimitClassifiedOnCodeNotStatus(t *testing.T) {
 // TestMakeRequest_honorsRetryAfterIfPresent pins the defensive path: Meta is not
 // expected to send Retry-After, but an edge or proxy might, and it should be
 // respected rather than ignored if it appears.
+//
+// With a fake clock the assertion is EXACT rather than "at least a second" — the
+// bubble's time advances precisely as far as the code waits, so a wrong delay fails
+// instead of passing a loose lower bound.
 func TestMakeRequest_honorsRetryAfterIfPresent(t *testing.T) {
-	var attempts int
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		if attempts == 1 {
-			w.Header().Set("Retry-After", "1")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_, _ = w.Write([]byte(`{"error":{"message":"throttled by edge","code":130429}}`))
-			return
-		}
-		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[{"id":"wamid.OK"}]}`))
-	}))
-	defer ts.Close()
+	synctest.Test(t, func(t *testing.T) {
+		h := http.Header{}
+		h.Set("Retry-After", "7")
+		tr := &scriptedTransport{responses: []scriptedResponse{
+			{status: http.StatusTooManyRequests, header: h,
+				body: `{"error":{"message":"throttled by edge","code":130429}}`},
+			{status: http.StatusOK, body: `{"messaging_product":"whatsapp","messages":[{"id":"wamid.OK"}]}`},
+		}}
 
-	c := newTestClient(ts)
-	start := time.Now()
-	_, err := c.SendText(context.Background(), "16505551234", "hi")
-	elapsed := time.Since(start)
+		start := time.Now()
+		_, err := scriptedClient(tr).SendText(context.Background(), "16505551234", "hi")
+		elapsed := time.Since(start)
 
-	require.NoError(t, err)
-	assert.Equal(t, 2, attempts)
-	assert.GreaterOrEqual(t, elapsed, time.Second, "a present Retry-After must be waited out")
+		require.NoError(t, err)
+		assert.Equal(t, 2, tr.attempts)
+		assert.Equal(t, 7*time.Second, elapsed,
+			"the server's Retry-After must be honoured exactly, not approximated by backoff")
+	})
+}
+
+// TestMakeRequest_backoffIsExponential pins the ladder itself, which was previously
+// untestable without sleeping 6 real seconds.
+//
+// maxAttempts=3 with no Retry-After: wait 2s, then 4s. A regression to a linear or
+// absent backoff now fails in zero real time.
+func TestMakeRequest_backoffIsExponential(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tr := &scriptedTransport{responses: []scriptedResponse{
+			{status: http.StatusBadRequest, body: `{"error":{"message":"unknown","code":131000}}`},
+		}}
+
+		start := time.Now()
+		_, err := scriptedClient(tr).SendText(context.Background(), "16505551234", "hi")
+		elapsed := time.Since(start)
+
+		require.Error(t, err)
+		assert.Equal(t, maxAttempts, tr.attempts)
+		assert.Contains(t, err.Error(), "giving up")
+		assert.Equal(t, 6*time.Second, elapsed, "backoff must be 2s then 4s")
+	})
 }
 
 // TestAPIError_templateSyncingNotRetriedInProcess pins that a syncing template is
@@ -261,36 +324,38 @@ func TestAPIError_notDeliveredIsNotFastRetried(t *testing.T) {
 // TestMakeRequest_doesNotRetryPermanentErrors pins that a non-transient error
 // fails fast instead of burning the retry budget.
 func TestMakeRequest_doesNotRetryPermanentErrors(t *testing.T) {
-	var attempts int
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"message":"bad param","code":131009}}`))
-	}))
-	defer ts.Close()
+	synctest.Test(t, func(t *testing.T) {
+		tr := &scriptedTransport{responses: []scriptedResponse{
+			{status: http.StatusBadRequest, body: `{"error":{"message":"bad param","code":131009}}`},
+		}}
+		start := time.Now()
+		_, err := scriptedClient(tr).SendText(context.Background(), "16505551234", "hi")
 
-	c := newTestClient(ts)
-	_, err := c.SendText(context.Background(), "16505551234", "hi")
-	require.Error(t, err)
-	assert.Equal(t, 1, attempts, "a permanent error must not be retried")
+		require.Error(t, err)
+		assert.Equal(t, 1, tr.attempts, "a permanent error must not be retried")
+		assert.Zero(t, time.Since(start), "and must not wait at all before giving up")
+	})
 }
 
-// TestMakeRequest_contextCancellationStopsRetry pins that ctx actually reaches
-// the transport, rather than being held for logging only.
+// TestMakeRequest_contextCancellationStopsRetry pins that ctx actually reaches the
+// transport, rather than being held for logging only.
+//
+// The deadline is fake here too: the bubble's clock drives context.WithTimeout, so a
+// 1s deadline against a 2s backoff resolves instantly and deterministically.
 func TestMakeRequest_contextCancellationStopsRetry(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(`{"error":{"message":"unavailable","code":131016}}`))
-	}))
-	defer ts.Close()
+	synctest.Test(t, func(t *testing.T) {
+		tr := &scriptedTransport{responses: []scriptedResponse{
+			{status: http.StatusServiceUnavailable, body: `{"error":{"message":"unavailable","code":131016}}`},
+		}}
+		// 1s deadline, 2s first backoff: the deadline must win.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
 
-	c := newTestClient(ts)
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
-	_, err := c.SendText(ctx, "16505551234", "hi")
-	require.Error(t, err)
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+		_, err := scriptedClient(tr).SendText(ctx, "16505551234", "hi")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.Equal(t, 1, tr.attempts, "the retry must be abandoned, not attempted")
+	})
 }
 
 // TestSend_validatesLocally pins that an invalid config never reaches the wire.
