@@ -80,11 +80,6 @@ type setPromptsRequest struct {
 	Prompts []string `json:"prompts"`
 }
 
-// setConversationalAutomationResponse is the success response for POST operations.
-type setConversationalAutomationResponse struct {
-	Success bool `json:"success"`
-}
-
 // GetConversationalAutomation reads the conversational_automation configuration
 // for the client's phone number.
 //
