@@ -158,3 +158,15 @@ func TestListTemplates_undecodableResponse(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decode")
 }
+
+// TestListTemplates_requestError pins the MakeRequest failure branch.
+func TestListTemplates_requestError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error": {"message": "internal error"}}`))
+	}))
+	defer ts.Close()
+
+	_, err := newTestClient(ts).ListTemplates(context.Background(), "WABA123", 0, "")
+	require.Error(t, err)
+}
