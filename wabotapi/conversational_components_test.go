@@ -254,3 +254,15 @@ func TestGetConversationalAutomation_undecodableResponse(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "decode")
 }
+
+// TestGetConversationalAutomation_requestError pins the MakeRequest failure branch.
+func TestGetConversationalAutomation_requestError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error": {"message": "internal error"}}`))
+	}))
+	defer ts.Close()
+
+	_, err := newTestClient(ts).GetConversationalAutomation(context.Background())
+	require.Error(t, err)
+}
