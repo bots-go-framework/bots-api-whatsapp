@@ -6,7 +6,7 @@ toolchain go1.27.4
 
 require (
 	github.com/stretchr/testify v1.12.1
-	github.com/strongo/logus v0.4.8
+	github.com/strongo/logus v0.4.9
 )
 
 require (
